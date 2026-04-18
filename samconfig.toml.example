@@ -1,0 +1,25 @@
+# samconfig.toml.example
+# Copy to samconfig.toml and fill in your values.
+# samconfig.toml is gitignored — never commit it.
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name     = "dm-n2n-bridge-dev"
+region         = "ap-southeast-2"
+confirm_changeset = true
+capabilities   = "CAPABILITY_IAM"
+resolve_s3     = true
+
+parameter_overrides = [
+  "Environment=dev",
+  "AlertEmail=ops@your-domain.com",
+
+  # SSM paths — these must match the paths where you stored secrets in Parameter Store
+  "N2NApiKeyParam=/dm-n2n-bridge/n2n-api-key",
+  "N2NEnterpriseIdParam=/dm-n2n-bridge/n2n-enterprise-id",
+  "N2NDeviceTypeParam=/dm-n2n-bridge/n2n-device-type",
+  "DmWebhookSecretParam=/dm-n2n-bridge/dm-webhook-secret",
+
+  "MaxRetryAttempts=5",
+]

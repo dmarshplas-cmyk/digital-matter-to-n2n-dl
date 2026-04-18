@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+pip-log.txt
+
+# SAM / AWS build artefacts
+.aws-sam/
+samconfig.toml          # contains deployment-specific config — use samconfig.toml.example
+packaged.yaml
+packaged-template.yaml
+*.zip
+
+# Lambda layer build output
+layers/*/python/lib/
+layers/*/python/bin/
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+
+# Secrets (never commit these)
+.env
+.env.*
+secrets.json
+*.pem

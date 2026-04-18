@@ -1,0 +1,352 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  DM → N2N-DL Bridge
+  Accepts Digital Matter webhooks, transforms to N2N-DL format, delivers
+  with retry logic. 30-day raw event cache in DynamoDB.
+
+# ─────────────────────────────────────────────
+# Parameters
+# ─────────────────────────────────────────────
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  N2NEnterpriseIdParam:
+    Type: String
+    Description: "SSM path for the N2N enterprise ID (e.g. /dm-n2n-bridge/n2n-enterprise-id)"
+    Default: "/dm-n2n-bridge/n2n-enterprise-id"
+
+  N2NDeviceTypeParam:
+    Type: String
+    Description: "SSM path for the N2N device type (e.g. /dm-n2n-bridge/n2n-device-type)"
+    Default: "/dm-n2n-bridge/n2n-device-type"
+
+  N2NApiKeyParam:
+    Type: String
+    Description: "SSM Parameter Store path for the N2N API key (SecureString)"
+    Default: "/dm-n2n-bridge/n2n-api-key"
+
+  DmWebhookSecretParam:
+    Type: String
+    Description: "SSM Parameter Store path for the DM webhook shared secret"
+    Default: "/dm-n2n-bridge/dm-webhook-secret"
+
+
+  MaxRetryAttempts:
+    Type: Number
+    Default: 5
+
+  AlertEmail:
+    Type: String
+    Description: "Email address for delivery failure alerts"
+
+# ─────────────────────────────────────────────
+# Globals
+# ─────────────────────────────────────────────
+Globals:
+  Function:
+    Runtime: python3.11
+    Architectures: [x86_64]          # x86_64 for broad Lambda layer compatibility
+    MemorySize: 256
+    Timeout: 30
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        N2N_ENTERPRISE_ID_PARAM: !Ref N2NEnterpriseIdParam
+        N2N_DEVICE_TYPE_PARAM: !Ref N2NDeviceTypeParam
+        N2N_API_KEY_PARAM: !Ref N2NApiKeyParam
+        DEBUG: "false"
+
+# ─────────────────────────────────────────────
+# Resources
+# ─────────────────────────────────────────────
+Resources:
+
+  # ── Lambda Layer (shared code) ──────────────
+  # ── SQS Queues ──────────────────────────────
+
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "dm-n2n-ingest-${Environment}.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      VisibilityTimeout: 60
+      MessageRetentionPeriod: 86400     # 1 day
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestDLQ.Arn
+        maxReceiveCount: 3
+
+  IngestDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "dm-n2n-ingest-dlq-${Environment}.fifo"
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  DeliverQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "dm-n2n-deliver-${Environment}.fifo"
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      VisibilityTimeout: 90
+      MessageRetentionPeriod: 86400
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeliverDLQ.Arn
+        maxReceiveCount: 3            # SQS retries before DLQ
+
+  DeliverDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "dm-n2n-deliver-dlq-${Environment}.fifo"
+      FifoQueue: true
+      VisibilityTimeout: 90
+      MessageRetentionPeriod: 1209600
+
+  # ── DynamoDB Tables ─────────────────────────
+
+  RawEventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "dm-n2n-raw-events-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      TableClass: STANDARD_INFREQUENT_ACCESS
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: device_sn
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: device_sn
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ── SNS Alert Topic ─────────────────────────
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "dm-n2n-alerts-${Environment}"
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  # ── API Gateway ─────────────────────────────
+
+  WebhookApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "dm-n2n-webhook-${Environment}"
+      StageName: !Ref Environment
+      EndpointConfiguration:
+        Type: REGIONAL
+      Auth:
+        DefaultAuthorizer: NONE     # Auth handled inside Lambda
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 20
+
+  # ── Lambda Functions ─────────────────────────
+
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "dm-n2n-ingest-${Environment}"
+      CodeUri: ../lambdas/ingest/
+      Handler: handler.handler
+      Description: "Receives DM webhook, validates auth, queues to SQS"
+      Timeout: 10
+      Environment:
+        Variables:
+          INGEST_QUEUE_URL: !Ref IngestQueue
+          RAW_TABLE: !Ref RawEventsTable
+          DM_SECRET_PARAM: !Ref DmWebhookSecretParam
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt IngestQueue.QueueName
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref DmWebhookSecretParam
+        - DynamoDBWritePolicy:
+            TableName: !Ref RawEventsTable
+      Events:
+        WebhookPost:
+          Type: Api
+          Properties:
+            RestApiId: !Ref WebhookApi
+            Path: /webhook
+            Method: POST
+
+  IngestFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/dm-n2n-ingest-${Environment}"
+      RetentionInDays: 30
+
+  TransformFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "dm-n2n-transform-${Environment}"
+      CodeUri: ../lambdas/transform/
+      Handler: handler.handler
+      Description: "Transforms DM payload to N2N format, enqueues for delivery"
+      Environment:
+        Variables:
+          DELIVER_QUEUE_URL: !Ref DeliverQueue
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DeliverQueue.QueueName
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref N2NEnterpriseIdParam
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref N2NDeviceTypeParam
+      Events:
+        IngestQueueTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngestQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures   # Partial batch failure support
+
+  TransformFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/dm-n2n-transform-${Environment}"
+      RetentionInDays: 30
+
+  DeliverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "dm-n2n-deliver-${Environment}"
+      CodeUri: ../lambdas/deliver/
+      Handler: handler.handler
+      Description: "POSTs transformed payload to N2N-DL ingestion API"
+      Timeout: 30
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt DeliverQueue.QueueName
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref N2NApiKeyParam
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref N2NEnterpriseIdParam
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref N2NDeviceTypeParam
+      Events:
+        DeliverQueueTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DeliverQueue.Arn
+            BatchSize: 1              # One delivery at a time for clean error isolation
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  DeliverFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/dm-n2n-deliver-${Environment}"
+      RetentionInDays: 30
+
+  RetryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "dm-n2n-retry-${Environment}"
+      CodeUri: ../lambdas/retry/
+      Handler: handler.handler
+      Description: "Handles delivery DLQ with exponential backoff and SNS alerting"
+      Timeout: 60
+      Environment:
+        Variables:
+          DELIVER_QUEUE_URL: !Ref DeliverQueue
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+          MAX_RETRY_ATTEMPTS: !Ref MaxRetryAttempts
+      Policies:
+        - SQSPollerPolicy:
+            QueueName: !GetAtt DeliverDLQ.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DeliverQueue.QueueName
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt AlertTopic.TopicName
+        - SSMParameterReadPolicy:
+            ParameterName: !Ref N2NApiKeyParam
+      Events:
+        DeliverDLQTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DeliverDLQ.Arn
+            BatchSize: 1
+
+  RetryFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/dm-n2n-retry-${Environment}"
+      RetentionInDays: 30
+
+  # ── CloudWatch Alarms ────────────────────────
+
+  DeliverDLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "dm-n2n-deliver-dlq-depth-${Environment}"
+      AlarmDescription: "Messages stuck in delivery DLQ"
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeliverDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  IngestErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "dm-n2n-ingest-errors-${Environment}"
+      AlarmDescription: "Ingest Lambda errors"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+# ─────────────────────────────────────────────
+# Outputs
+# ─────────────────────────────────────────────
+Outputs:
+  WebhookUrl:
+    Description: "Digital Matter webhook endpoint – configure this in DM Device Manager"
+    Value: !Sub "https://${WebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/webhook"
+
+  RawEventsTableName:
+    Value: !Ref RawEventsTable
+
+  IngestQueueUrl:
+    Value: !Ref IngestQueue
+
+  DeliverDLQUrl:
+    Value: !Ref DeliverDLQ
