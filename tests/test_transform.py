@@ -8,7 +8,7 @@ import sys
 import os
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../layers/common/python"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../lambdas/ingest"))
 
 from n2n_common import to_n2n_token, make_n2n_device_id, basic_auth_header, build_reading_list
 
@@ -112,7 +112,7 @@ class TestBuildReadingList:
         assert self.by_label["analogue-13"]["value"] == -28
 
     def test_analogue_type_label(self):
-        assert self.by_label["analogue-1"]["type"] == "analogue"
+        assert self.by_label["analogue-1"]["type"] == "analog"
 
     # ── Counter passthrough ──────────────────────────────────────────────────
     def test_all_counters_present(self):
