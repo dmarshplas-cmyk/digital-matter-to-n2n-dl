@@ -46,6 +46,12 @@ Device Manager  ──POST──▶  API Gateway
 
 ---
 
+## Deployment
+
+For full step-by-step instructions — AWS credentials, SSM setup, SAM build/deploy, DM Device Manager configuration, and verification — see **[DEPLOYMENT.md](./DEPLOYMENT.md)**.
+
+---
+
 ## Prerequisites
 
 - [AWS SAM CLI](https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/install-sam-cli.html)
